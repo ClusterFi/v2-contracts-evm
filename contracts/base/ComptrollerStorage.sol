@@ -16,6 +16,7 @@ abstract contract ComptrollerStorageV1 {
         //  For instance, 0.9 to allow borrowing 90% of collateral value.
         //  Must be between 0 and 1, and stored as a mantissa.
         uint256 collateralFactorMantissa;
+        uint256 destinationId;
         // Per-market mapping of "accounts in this asset"
         mapping(address => bool) accountMembership;
         // Whether or not this market receives CLR
@@ -73,8 +74,9 @@ abstract contract ComptrollerStorageV1 {
 
     mapping(address => bool) public borrowGuardianPaused;
 
-    /// @notice A list of all markets
-    address[] public allMarkets;
+    mapping(address => bool) public isMarketListed;
+    mapping(uint256 => address) public allMarketsIndex;
+    uint256 public marketCount;
 }
 
 abstract contract ComptrollerStorageV2 {

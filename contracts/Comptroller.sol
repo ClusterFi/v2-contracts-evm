@@ -1,19 +1,31 @@
 // SPDX-License-Identifier: BSD-3-Clause
 pragma solidity ^0.8.20;
 
-import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import { IClErc20, IPriceOracle } from "./interfaces/IPriceOracle.sol";
-import { IClToken } from "./interfaces/IClToken.sol";
-import { IComptroller } from "./interfaces/IComptroller.sol";
-import { IClusterToken } from "./interfaces/IClusterToken.sol";
-import { ExponentialNoError } from "./ExponentialNoError.sol";
-import { ComptrollerStorage } from "./base/ComptrollerStorage.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {IClErc20, IPriceOracle} from "./interfaces/IPriceOracle.sol";
+import {IClToken} from "./interfaces/IClToken.sol";
+import {IComptroller} from "./interfaces/IComptroller.sol";
+import {IClusterToken} from "./interfaces/IClusterToken.sol";
+import {ExponentialNoError} from "./ExponentialNoError.sol";
+import {ComptrollerStorage} from "./base/ComptrollerStorage.sol";
+import {Errors} from "./libraries/Errors.sol";
 
 /**
  * @title Cluster's Comptroller Contract
  * @author Cluster
  */
-contract Comptroller is Initializable, IComptroller, ExponentialNoError, ComptrollerStorage {
+contract Comptroller is
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable,
+    IComptroller,
+    ExponentialNoError,
+    ComptrollerStorage
+{
     /// @notice Indicator that this is a Comptroller contract (for inspection)
     bool public constant isComptroller = true;
 
@@ -21,62 +33,28 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     uint224 public constant clrInitialIndex = 1e36;
 
     /// @dev closeFactorMantissa must be strictly greater than this value
-    uint internal constant closeFactorMinMantissa = 0.05e18; // 0.05
+    uint256 internal constant closeFactorMinMantissa = 0.05e18; // 0.05
 
     /// @dev closeFactorMantissa must not exceed this value
-    uint internal constant closeFactorMaxMantissa = 0.9e18; // 0.9
+    uint256 internal constant closeFactorMaxMantissa = 0.9e18; // 0.9
 
     /// @dev No collateralFactorMantissa may exceed this value
-    uint internal constant collateralFactorMaxMantissa = 0.9e18; // 0.9
+    uint256 internal constant collateralFactorMaxMantissa = 0.9e18; // 0.9
+
+    /// @notice Gap to add new variables without breaking storage layout
+    uint256[50] private ______gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    function initialize() public initializer {
-        admin = msg.sender;
-    }
-
-    /*** Admin Functions ***/
-
-    /**
-     * @notice Admin function to begin change of admin.
-     * @dev Begins transfer of admin rights. The newPendingAdmin must call `acceptAdmin` to
-     * finalize the transfer.
-     * @param _newPendingAdmin The new pending admin.
-     */
-    function setPendingAdmin(address _newPendingAdmin) public {
-        // Check if caller is admin
-        _onlyAdmin();
-        // check if new admin is not zero address
-        if (_newPendingAdmin == address(0)) revert ZeroAddress();
-
-        address _oldPendingAdmin = pendingAdmin;
-
-        pendingAdmin = _newPendingAdmin;
-
-        emit NewPendingAdmin(_oldPendingAdmin, _newPendingAdmin);
-    }
-
-    /**
-     * @notice Accepts transfer of admin rights. The caller must be pendingAdmin.
-     * @dev Admin function for pending admin to accept role and update admin.
-     */
-    function acceptAdmin() public {
-        // Check if caller is pendingAdmin
-        if (msg.sender != pendingAdmin) revert NotPendingAdmin();
-
-        address _oldAdmin = admin;
-        address _oldPendingAdmin = pendingAdmin;
-
-        admin = pendingAdmin;
-
-        // Clear the pending value
-        pendingAdmin = address(0);
-
-        emit NewAdmin(_oldAdmin, admin);
-        emit NewPendingAdmin(_oldPendingAdmin, pendingAdmin);
+    function initialize(address _admin) public initializer {
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
 
     /**
@@ -84,11 +62,9 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @dev Admin function to set isListed and add support for the market
      * @param clToken The address of the market (token) to list
      */
-    function supportMarket(address clToken) external {
-        _onlyAdmin();
-
+    function supportMarket(address clToken) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (markets[clToken].isListed) {
-            revert MarketIsAlreadyListed(clToken);
+            revert Errors.MarketIsAlreadyListed(clToken);
         }
 
         // Sanity check to make sure its really a ClToken
@@ -110,9 +86,8 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @notice Sets a new price oracle for the comptroller
      * @dev Admin function to set a new price oracle
      */
-    function setPriceOracle(address _newOracle) public {
-        // Check caller is admin
-        _onlyAdmin();
+    function setPriceOracle(address _newOracle) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_newOracle == address(0)) revert Errors.ZeroAddress();
 
         // Sanity check to make sure its really a PriceOracle
         IPriceOracle(_newOracle).isPriceOracle();
@@ -132,11 +107,11 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @dev Admin function to set closeFactor
      * @param newCloseFactorMantissa New close factor, scaled by 1e18
      */
-    function setCloseFactor(uint newCloseFactorMantissa) external {
-        // Check caller is admin
-        _onlyAdmin();
-
-        uint oldCloseFactorMantissa = closeFactorMantissa;
+    function setCloseFactor(uint256 newCloseFactorMantissa) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newCloseFactorMantissa < closeFactorMinMantissa || newCloseFactorMantissa > closeFactorMaxMantissa) {
+            revert Errors.InvalidCloseFactor();
+        }
+        uint256 oldCloseFactorMantissa = closeFactorMantissa;
         closeFactorMantissa = newCloseFactorMantissa;
         emit NewCloseFactor(oldCloseFactorMantissa, closeFactorMantissa);
     }
@@ -147,34 +122,31 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param clToken The market to set the factor on
      * @param newCollateralFactorMantissa The new collateral factor, scaled by 1e18
      */
-    function setCollateralFactor(address clToken, uint newCollateralFactorMantissa) external {
-        // Check caller is admin
-        _onlyAdmin();
-
+    function setCollateralFactor(address clToken, uint256 newCollateralFactorMantissa)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
         // Verify market is listed
         Market storage market = markets[clToken];
         if (!market.isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
-        Exp memory newCollateralFactorExp = Exp({ mantissa: newCollateralFactorMantissa });
+        Exp memory newCollateralFactorExp = Exp({mantissa: newCollateralFactorMantissa});
 
         // Check collateral factor <= 0.9
-        Exp memory highLimit = Exp({ mantissa: collateralFactorMaxMantissa });
+        Exp memory highLimit = Exp({mantissa: collateralFactorMaxMantissa});
         if (lessThanExp(highLimit, newCollateralFactorExp)) {
-            revert InvalidCollateralFactor();
+            revert Errors.InvalidCollateralFactor();
         }
 
         // If collateral factor != 0, fail if price == 0
-        if (
-            newCollateralFactorMantissa != 0 &&
-            IPriceOracle(oracle).getUnderlyingPrice(IClErc20(clToken)) == 0
-        ) {
-            revert SetCollFactorWithoutPrice();
+        if (newCollateralFactorMantissa != 0 && IPriceOracle(oracle).getUnderlyingPrice(IClErc20(clToken)) == 0) {
+            revert Errors.SetCollFactorWithoutPrice();
         }
 
         // Set market's collateral factor to new collateral factor, remember old value
-        uint oldCollateralFactorMantissa = market.collateralFactorMantissa;
+        uint256 oldCollateralFactorMantissa = market.collateralFactorMantissa;
         market.collateralFactorMantissa = newCollateralFactorMantissa;
 
         // Emit event with asset, old collateral factor, and new collateral factor
@@ -186,20 +158,15 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @dev Admin function to set liquidationIncentive
      * @param newLiquidationIncentiveMantissa New liquidationIncentive scaled by 1e18
      */
-    function setLiquidationIncentive(uint newLiquidationIncentiveMantissa) external {
-        _onlyAdmin();
-
+    function setLiquidationIncentive(uint256 newLiquidationIncentiveMantissa) external onlyRole(DEFAULT_ADMIN_ROLE) {
         // Save current value for use in log
-        uint oldLiquidationIncentiveMantissa = liquidationIncentiveMantissa;
+        uint256 oldLiquidationIncentiveMantissa = liquidationIncentiveMantissa;
 
         // Set liquidation incentive to new incentive
         liquidationIncentiveMantissa = newLiquidationIncentiveMantissa;
 
         // Emit event with old incentive, new incentive
-        emit NewLiquidationIncentive(
-            oldLiquidationIncentiveMantissa,
-            newLiquidationIncentiveMantissa
-        );
+        emit NewLiquidationIncentive(oldLiquidationIncentiveMantissa, newLiquidationIncentiveMantissa);
     }
 
     /**
@@ -211,22 +178,19 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param newBorrowCaps The new borrow cap values in underlying to be set.
      * A value of 0 corresponds to unlimited borrowing.
      */
-    function setMarketBorrowCaps(
-        address[] calldata clTokens,
-        uint[] calldata newBorrowCaps
-    ) external {
+    function setMarketBorrowCaps(address[] calldata clTokens, uint256[] calldata newBorrowCaps) external {
         if (msg.sender != admin && msg.sender != borrowCapGuardian) {
-            revert NotAdminOrBorrowCapGuardian();
+            revert Errors.NotAdminOrBorrowCapGuardian();
         }
 
-        uint numMarkets = clTokens.length;
-        uint numBorrowCaps = newBorrowCaps.length;
+        uint256 numMarkets = clTokens.length;
+        uint256 numBorrowCaps = newBorrowCaps.length;
 
         if (numMarkets == 0 || numMarkets != numBorrowCaps) {
-            revert ArrayLengthMismatch();
+            revert Errors.ArrayLengthMismatch();
         }
 
-        for (uint i = 0; i < numMarkets; ) {
+        for (uint256 i = 0; i < numMarkets;) {
             borrowCaps[clTokens[i]] = newBorrowCaps[i];
             emit NewBorrowCap(clTokens[i], newBorrowCaps[i]);
 
@@ -240,9 +204,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @notice Admin function to change the Borrow Cap Guardian
      * @param newBorrowCapGuardian The address of the new Borrow Cap Guardian
      */
-    function setBorrowCapGuardian(address newBorrowCapGuardian) external {
-        _onlyAdmin();
-
+    function setBorrowCapGuardian(address newBorrowCapGuardian) external onlyRole(DEFAULT_ADMIN_ROLE) {
         // Save current value for inclusion in log
         address oldBorrowCapGuardian = borrowCapGuardian;
 
@@ -257,9 +219,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @notice Admin function to change the Pause Guardian
      * @param newPauseGuardian The address of the new Pause Guardian
      */
-    function setPauseGuardian(address newPauseGuardian) external {
-        _onlyAdmin();
-
+    function setPauseGuardian(address newPauseGuardian) external onlyRole(DEFAULT_ADMIN_ROLE) {
         // Save current value for inclusion in log
         address oldPauseGuardian = pauseGuardian;
 
@@ -272,13 +232,13 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
 
     function setMintPaused(address clToken, bool state) external returns (bool) {
         if (!markets[clToken].isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
         if (msg.sender != pauseGuardian && msg.sender != admin) {
-            revert NotAdminOrPauseGuardian();
+            revert Errors.NotAdminOrPauseGuardian();
         }
         if (msg.sender != admin && state == false) {
-            revert NotAdmin();
+            revert Errors.NotAdmin();
         }
 
         mintGuardianPaused[clToken] = state;
@@ -288,13 +248,13 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
 
     function setBorrowPaused(address clToken, bool state) external returns (bool) {
         if (!markets[clToken].isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
         if (msg.sender != pauseGuardian && msg.sender != admin) {
-            revert NotAdminOrPauseGuardian();
+            revert Errors.NotAdminOrPauseGuardian();
         }
         if (msg.sender != admin && state == false) {
-            revert NotAdmin();
+            revert Errors.NotAdmin();
         }
 
         borrowGuardianPaused[clToken] = state;
@@ -304,10 +264,10 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
 
     function setTransferPaused(bool state) external returns (bool) {
         if (msg.sender != pauseGuardian && msg.sender != admin) {
-            revert NotAdminOrPauseGuardian();
+            revert Errors.NotAdminOrPauseGuardian();
         }
         if (msg.sender != admin && state == false) {
-            revert NotAdmin();
+            revert Errors.NotAdmin();
         }
 
         transferGuardianPaused = state;
@@ -317,10 +277,10 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
 
     function setSeizePaused(bool state) external returns (bool) {
         if (msg.sender != pauseGuardian && msg.sender != admin) {
-            revert NotAdminOrPauseGuardian();
+            revert Errors.NotAdminOrPauseGuardian();
         }
         if (msg.sender != admin && state == false) {
-            revert NotAdmin();
+            revert Errors.NotAdmin();
         }
 
         seizeGuardianPaused = state;
@@ -332,9 +292,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @notice Set the Cluster token address
      * @param newClrAddress New CLR token address
      */
-    function setClrAddress(address newClrAddress) external {
-        _onlyAdmin();
-
+    function setClrAddress(address newClrAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
         address oldClrAddress = clrAddress;
 
         clrAddress = newClrAddress;
@@ -342,9 +300,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         emit NewClrAddress(oldClrAddress, newClrAddress);
     }
 
-    function setLeverageAddress(address newLeverage) external {
-        _onlyAdmin();
-
+    function setLeverageAddress(address newLeverage) external onlyRole(DEFAULT_ADMIN_ROLE) {
         address oldLeverageAddress = leverageAddress;
 
         leverageAddress = newLeverage;
@@ -352,16 +308,16 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         emit NewLeverageAddress(oldLeverageAddress, newLeverage);
     }
 
-    /*** Clr Distribution Admin ***/
+    /**
+     * Clr Distribution Admin **
+     */
 
     /**
      * @notice Set CLR speed for a single contributor
      * @param contributor The contributor whose CLR speed to update
      * @param clrSpeed New CLR speed for contributor
      */
-    function setContributorClrSpeed(address contributor, uint clrSpeed) public {
-        _onlyAdmin();
-
+    function setContributorClrSpeed(address contributor, uint256 clrSpeed) public onlyRole(DEFAULT_ADMIN_ROLE) {
         // note that CLR speed could be set to 0 to halt liquidity rewards for a contributor
         updateContributorRewards(contributor);
         if (clrSpeed == 0) {
@@ -381,19 +337,16 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param supplySpeeds New supply-side CLR speed for the corresponding market.
      * @param borrowSpeeds New borrow-side CLR speed for the corresponding market.
      */
-    function setClrSpeeds(
-        address[] memory clTokens,
-        uint[] memory supplySpeeds,
-        uint[] memory borrowSpeeds
-    ) public {
-        _onlyAdmin();
-
-        uint numTokens = clTokens.length;
+    function setClrSpeeds(address[] memory clTokens, uint256[] memory supplySpeeds, uint256[] memory borrowSpeeds)
+        public
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        uint256 numTokens = clTokens.length;
         if (numTokens != supplySpeeds.length || numTokens != borrowSpeeds.length) {
-            revert ArrayLengthMismatch();
+            revert Errors.ArrayLengthMismatch();
         }
 
-        for (uint i = 0; i < numTokens; ) {
+        for (uint256 i = 0; i < numTokens;) {
             setClrSpeedInternal(clTokens[i], supplySpeeds[i], borrowSpeeds[i]);
             unchecked {
                 i++;
@@ -407,12 +360,10 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param recipient The address of the recipient to transfer CLR to
      * @param amount The amount of CLR to (possibly) transfer
      */
-    function grantClr(address recipient, uint amount) public {
-        _onlyAdmin();
-
-        uint amountLeft = grantClrInternal(recipient, amount);
+    function grantClr(address recipient, uint256 amount) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 amountLeft = grantClrInternal(recipient, amount);
         if (amountLeft > 0) {
-            revert InsufficientClrForGrant();
+            revert Errors.InsufficientClrForGrant();
         }
         emit ClrGranted(recipient, amount);
     }
@@ -422,7 +373,14 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         return (market.isListed, market.collateralFactorMantissa);
     }
 
-    /*** Assets You Are In ***/
+    function getAllMarkets() public view returns (address[] memory) {
+        address[] memory markets = new address[](marketCount);
+        for (uint256 i = 0; i < marketCount; i++) {
+            markets[i] = allMarketsIndex[i];
+        }
+        return markets;
+    }
+
 
     /**
      * @notice Returns the assets an account has entered
@@ -450,9 +408,9 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param clTokens The list of addresses of the clToken markets to be enabled
      */
     function enterMarkets(address[] memory clTokens) public {
-        uint len = clTokens.length;
+        uint256 len = clTokens.length;
 
-        for (uint i = 0; i < len; ) {
+        for (uint256 i = 0; i < len;) {
             addToMarketInternal(clTokens[i], msg.sender);
             unchecked {
                 i++;
@@ -470,7 +428,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
 
         if (!marketToJoin.isListed) {
             // market is not listed, cannot join
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
         if (marketToJoin.accountMembership[borrower] == true) return;
@@ -495,11 +453,11 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     function exitMarket(address clTokenAddress) external {
         IClToken clToken = IClToken(clTokenAddress);
         /* Get sender tokensHeld and amountOwed underlying from the clToken */
-        (uint tokensHeld, uint amountOwed, ) = clToken.getAccountSnapshot(msg.sender);
+        (uint256 tokensHeld, uint256 amountOwed,) = clToken.getAccountSnapshot(msg.sender);
 
         /* Fail if the sender has a borrow balance */
         if (amountOwed != 0) {
-            revert NonZeroBorrowBalance();
+            revert Errors.NonZeroBorrowBalance();
         }
 
         /* Fail if the sender is not permitted to redeem all of their tokens */
@@ -516,9 +474,9 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         /* Delete clToken from the account’s list of assets */
         // load into memory for faster iteration
         address[] memory userAssetList = accountAssets[msg.sender];
-        uint len = userAssetList.length;
-        uint assetIndex = len;
-        for (uint i = 0; i < len; i++) {
+        uint256 len = userAssetList.length;
+        uint256 assetIndex = len;
+        for (uint256 i = 0; i < len; i++) {
             if (userAssetList[i] == address(clToken)) {
                 assetIndex = i;
                 break;
@@ -536,7 +494,9 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         emit MarketExited(address(clToken), msg.sender);
     }
 
-    /*** Policy Hooks ***/
+    /**
+     * Policy Hooks **
+     */
 
     /**
      * @notice Checks if the account should be allowed to mint tokens in the given market
@@ -544,17 +504,17 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param minter The account which would get the minted tokens
      * @param mintAmount The amount of underlying being supplied to the market in exchange for tokens
      */
-    function mintAllowed(address clToken, address minter, uint mintAmount) external {
-        // Pausing is a very serious situation - we revert to sound the alarms
+    function mintAllowed(address clToken, address minter, uint256 mintAmount) external {
+        // Pausing is a very serious situation - we revert Errors.to sound the alarms
         if (mintGuardianPaused[clToken]) {
-            revert MintIsPaused();
+            revert Errors.MintIsPaused();
         }
         // Shh - currently unused
         minter;
         mintAmount;
 
         if (!markets[clToken].isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
         // Keep the flywheel moving
@@ -568,7 +528,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param redeemer The account which would redeem the tokens
      * @param redeemTokens The number of clTokens to exchange for the underlying asset in the market
      */
-    function redeemAllowed(address clToken, address redeemer, uint redeemTokens) external {
+    function redeemAllowed(address clToken, address redeemer, uint256 redeemTokens) external {
         redeemAllowedInternal(clToken, redeemer, redeemTokens);
 
         // Keep the flywheel moving
@@ -576,28 +536,19 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         distributeSupplierClr(clToken, redeemer);
     }
 
-    function redeemAllowedInternal(
-        address clToken,
-        address redeemer,
-        uint redeemTokens
-    ) internal view {
+    function redeemAllowedInternal(address clToken, address redeemer, uint256 redeemTokens) internal view {
         if (!markets[clToken].isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
         /* If the redeemer is not 'in' the market, then we can bypass the liquidity check */
         if (!markets[clToken].accountMembership[redeemer]) return;
 
         /* Otherwise, perform a hypothetical liquidity check to guard against shortfall */
-        (, uint shortfall) = getHypotheticalAccountLiquidityInternal(
-            redeemer,
-            clToken,
-            redeemTokens,
-            0
-        );
+        (, uint256 shortfall) = getHypotheticalAccountLiquidityInternal(redeemer, clToken, redeemTokens, 0);
 
         if (shortfall > 0) {
-            revert InsufficientLiquidity();
+            revert Errors.InsufficientLiquidity();
         }
     }
 
@@ -608,19 +559,17 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param redeemAmount The amount of the underlying asset being redeemed
      * @param redeemTokens The number of tokens being redeemed
      */
-    function redeemVerify(
-        address clToken,
-        address redeemer,
-        uint redeemAmount,
-        uint redeemTokens
-    ) external pure {
+    function redeemVerify(address clToken, address redeemer, uint256 redeemAmount, uint256 redeemTokens)
+        external
+        pure
+    {
         // Shh - currently unused
         clToken;
         redeemer;
 
         // Require tokens is zero or amount is also zero
         if (redeemTokens == 0 && redeemAmount > 0) {
-            revert ZeroRedeemTokens();
+            revert Errors.ZeroRedeemTokens();
         }
     }
 
@@ -630,20 +579,20 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param borrower The account which would borrow the asset
      * @param borrowAmount The amount of underlying the account would borrow
      */
-    function borrowAllowed(address clToken, address borrower, uint borrowAmount) external {
-        // Pausing is a very serious situation - we revert to sound the alarms
+    function borrowAllowed(address clToken, address borrower, uint256 borrowAmount) external {
+        // Pausing is a very serious situation - we revert Errors.to sound the alarms
         if (borrowGuardianPaused[clToken]) {
-            revert BorrowIsPaused();
+            revert Errors.BorrowIsPaused();
         }
 
         if (!markets[clToken].isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
         if (!markets[clToken].accountMembership[borrower]) {
             // only clTokens may call borrowAllowed if borrower not in market
             if (msg.sender != clToken) {
-                revert SenderMustBeClToken();
+                revert Errors.SenderMustBeClToken();
             }
             // attempt to add borrower to the market
             addToMarketInternal(msg.sender, borrower);
@@ -653,39 +602,34 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         }
 
         if (IPriceOracle(oracle).getUnderlyingPrice(IClErc20(clToken)) == 0) {
-            revert ZeroPrice();
+            revert Errors.ZeroPrice();
         }
 
-        uint borrowCap = borrowCaps[clToken];
+        uint256 borrowCap = borrowCaps[clToken];
         // Borrow cap of 0 corresponds to unlimited borrowing
         if (borrowCap != 0) {
-            uint totalBorrows = IClToken(clToken).totalBorrows();
-            uint nextTotalBorrows = add_(totalBorrows, borrowAmount);
+            uint256 totalBorrows = IClToken(clToken).totalBorrows();
+            uint256 nextTotalBorrows = add_(totalBorrows, borrowAmount);
             if (nextTotalBorrows >= borrowCap) {
-                revert BorrowCapReached();
+                revert Errors.BorrowCapReached();
             }
         }
 
-        (, uint shortfall) = getHypotheticalAccountLiquidityInternal(
-            borrower,
-            clToken,
-            0,
-            borrowAmount
-        );
+        (, uint256 shortfall) = getHypotheticalAccountLiquidityInternal(borrower, clToken, 0, borrowAmount);
 
         if (shortfall > 0) {
-            revert InsufficientLiquidity();
+            revert Errors.InsufficientLiquidity();
         }
 
         // Keep the flywheel moving
-        Exp memory borrowIndex = Exp({ mantissa: IClToken(clToken).borrowIndex() });
+        Exp memory borrowIndex = Exp({mantissa: IClToken(clToken).borrowIndex()});
         updateClrBorrowIndex(clToken, borrowIndex);
         distributeBorrowerClr(clToken, borrower, borrowIndex);
     }
 
     function borrowBehalfAllowed(address sender) external view {
         if (sender != leverageAddress) {
-            revert SenderMustBeLeverage();
+            revert Errors.SenderMustBeLeverage();
         }
     }
 
@@ -696,23 +640,18 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param borrower The account which would borrowed the asset
      * @param repayAmount The amount of the underlying asset the account would repay
      */
-    function repayBorrowAllowed(
-        address clToken,
-        address payer,
-        address borrower,
-        uint repayAmount
-    ) external {
+    function repayBorrowAllowed(address clToken, address payer, address borrower, uint256 repayAmount) external {
         // Shh - currently unused
         payer;
         borrower;
         repayAmount;
 
         if (!markets[clToken].isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
         // Keep the flywheel moving
-        Exp memory borrowIndex = Exp({ mantissa: IClToken(clToken).borrowIndex() });
+        Exp memory borrowIndex = Exp({mantissa: IClToken(clToken).borrowIndex()});
         updateClrBorrowIndex(clToken, borrowIndex);
         distributeBorrowerClr(clToken, borrower, borrowIndex);
     }
@@ -730,34 +669,31 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         address clTokenCollateral,
         address liquidator,
         address borrower,
-        uint repayAmount
+        uint256 repayAmount
     ) external view {
         // Shh - currently unused
         liquidator;
 
-        if (!markets[clTokenBorrowed].isListed) revert MarketIsNotListed(clTokenBorrowed);
-        if (!markets[clTokenCollateral].isListed) revert MarketIsNotListed(clTokenCollateral);
+        if (!markets[clTokenBorrowed].isListed) revert Errors.MarketIsNotListed(clTokenBorrowed);
+        if (!markets[clTokenCollateral].isListed) revert Errors.MarketIsNotListed(clTokenCollateral);
 
-        uint borrowBalance = IClToken(clTokenBorrowed).borrowBalanceStored(borrower);
+        uint256 borrowBalance = IClToken(clTokenBorrowed).borrowBalanceStored(borrower);
 
         /* allow accounts to be liquidated if the market is deprecated */
         if (isDeprecated(clTokenBorrowed)) {
-            if (borrowBalance < repayAmount) revert RepayShouldBeLessThanTotalBorrow();
+            if (borrowBalance < repayAmount) revert Errors.RepayShouldBeLessThanTotalBorrow();
         } else {
             /* The borrower must have shortfall in order to be liquidatable */
-            (, uint shortfall) = getAccountLiquidityInternal(borrower);
+            (, uint256 shortfall) = getAccountLiquidityInternal(borrower);
 
             if (shortfall == 0) {
-                revert InsufficientShortfall();
+                revert Errors.InsufficientShortfall();
             }
 
             /* The liquidator may not repay more than what is allowed by the closeFactor */
-            uint maxClose = mul_ScalarTruncate(
-                Exp({ mantissa: closeFactorMantissa }),
-                borrowBalance
-            );
+            uint256 maxClose = mul_ScalarTruncate(Exp({mantissa: closeFactorMantissa}), borrowBalance);
             if (repayAmount > maxClose) {
-                revert TooMuchRepay();
+                revert Errors.TooMuchRepay();
             }
         }
     }
@@ -775,21 +711,21 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         address clTokenBorrowed,
         address liquidator,
         address borrower,
-        uint seizeTokens
+        uint256 seizeTokens
     ) external {
-        // Pausing is a very serious situation - we revert to sound the alarms
+        // Pausing is a very serious situation - we revert Errors.to sound the alarms
         if (seizeGuardianPaused) {
-            revert SeizeIsPaused();
+            revert Errors.SeizeIsPaused();
         }
 
         // Shh - currently unused
         seizeTokens;
 
-        if (!markets[clTokenCollateral].isListed) revert MarketIsNotListed(clTokenCollateral);
-        if (!markets[clTokenBorrowed].isListed) revert MarketIsNotListed(clTokenBorrowed);
+        if (!markets[clTokenCollateral].isListed) revert Errors.MarketIsNotListed(clTokenCollateral);
+        if (!markets[clTokenBorrowed].isListed) revert Errors.MarketIsNotListed(clTokenBorrowed);
 
         if (IClToken(clTokenCollateral).comptroller() != IClToken(clTokenBorrowed).comptroller()) {
-            revert ComptrollerMismatch();
+            revert Errors.ComptrollerMismatch();
         }
 
         // Keep the flywheel moving
@@ -805,15 +741,10 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param dst The account which receives the tokens
      * @param transferTokens The number of clTokens to transfer
      */
-    function transferAllowed(
-        address clToken,
-        address src,
-        address dst,
-        uint transferTokens
-    ) external {
-        // Pausing is a very serious situation - we revert to sound the alarms
+    function transferAllowed(address clToken, address src, address dst, uint256 transferTokens) external {
+        // Pausing is a very serious situation - we revert Errors.to sound the alarms
         if (transferGuardianPaused) {
-            revert TransferIsPaused();
+            revert Errors.TransferIsPaused();
         }
 
         // Currently the only consideration is whether or not
@@ -826,7 +757,9 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         distributeSupplierClr(clToken, dst);
     }
 
-    /*** Liquidity/Liquidation Calculations ***/
+    /**
+     * Liquidity/Liquidation Calculations **
+     */
 
     /**
      * @dev Local vars for avoiding stack-depth limits in calculating account liquidity.
@@ -834,12 +767,12 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      *  whereas `borrowBalance` is the amount of underlying that the account has borrowed.
      */
     struct AccountLiquidityLocalVars {
-        uint sumCollateral;
-        uint sumBorrowPlusEffects;
-        uint clTokenBalance;
-        uint borrowBalance;
-        uint exchangeRateMantissa;
-        uint oraclePriceMantissa;
+        uint256 sumCollateral;
+        uint256 sumBorrowPlusEffects;
+        uint256 clTokenBalance;
+        uint256 borrowBalance;
+        uint256 exchangeRateMantissa;
+        uint256 oraclePriceMantissa;
         Exp collateralFactor;
         Exp exchangeRate;
         Exp oraclePrice;
@@ -851,13 +784,8 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @return (account liquidity in excess of collateral requirements,
      *          account shortfall below collateral requirements)
      */
-    function getAccountLiquidity(address account) public view returns (uint, uint) {
-        (uint liquidity, uint shortfall) = getHypotheticalAccountLiquidityInternal(
-            account,
-            address(0),
-            0,
-            0
-        );
+    function getAccountLiquidity(address account) public view returns (uint256, uint256) {
+        (uint256 liquidity, uint256 shortfall) = getHypotheticalAccountLiquidityInternal(account, address(0), 0, 0);
 
         return (liquidity, shortfall);
     }
@@ -865,10 +793,10 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     /**
      * @notice Determine the current account liquidity wrt collateral requirements
      * @return (possible error code,
-                account liquidity in excess of collateral requirements,
+     *             account liquidity in excess of collateral requirements,
      *          account shortfall below collateral requirements)
      */
-    function getAccountLiquidityInternal(address account) internal view returns (uint, uint) {
+    function getAccountLiquidityInternal(address account) internal view returns (uint256, uint256) {
         return getHypotheticalAccountLiquidityInternal(account, address(0), 0, 0);
     }
 
@@ -884,15 +812,11 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     function getHypotheticalAccountLiquidity(
         address account,
         address clTokenModify,
-        uint redeemTokens,
-        uint borrowAmount
-    ) public view returns (uint, uint) {
-        (uint liquidity, uint shortfall) = getHypotheticalAccountLiquidityInternal(
-            account,
-            clTokenModify,
-            redeemTokens,
-            borrowAmount
-        );
+        uint256 redeemTokens,
+        uint256 borrowAmount
+    ) public view returns (uint256, uint256) {
+        (uint256 liquidity, uint256 shortfall) =
+            getHypotheticalAccountLiquidityInternal(account, clTokenModify, redeemTokens, borrowAmount);
         return (liquidity, shortfall);
     }
 
@@ -910,72 +834,51 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     function getHypotheticalAccountLiquidityInternal(
         address account,
         address clTokenModify,
-        uint redeemTokens,
-        uint borrowAmount
-    ) internal view returns (uint, uint) {
+        uint256 redeemTokens,
+        uint256 borrowAmount
+    ) internal view returns (uint256, uint256) {
         AccountLiquidityLocalVars memory vars; // Holds all our calculation results
 
         // For each asset the account is in
         address[] memory assets = accountAssets[account];
-        for (uint i = 0; i < assets.length; i++) {
+        for (uint256 i = 0; i < assets.length; i++) {
             IClToken asset = IClToken(assets[i]);
 
             // Read the balances and exchange rate from the clToken
-            (vars.clTokenBalance, vars.borrowBalance, vars.exchangeRateMantissa) = asset
-                .getAccountSnapshot(account);
+            (vars.clTokenBalance, vars.borrowBalance, vars.exchangeRateMantissa) = asset.getAccountSnapshot(account);
 
-            vars.collateralFactor = Exp({
-                mantissa: markets[address(asset)].collateralFactorMantissa
-            });
-            vars.exchangeRate = Exp({ mantissa: vars.exchangeRateMantissa });
+            vars.collateralFactor = Exp({mantissa: markets[address(asset)].collateralFactorMantissa});
+            vars.exchangeRate = Exp({mantissa: vars.exchangeRateMantissa});
 
             // Get the normalized price of the asset
-            vars.oraclePriceMantissa = IPriceOracle(oracle).getUnderlyingPrice(
-                IClErc20(address(asset))
-            );
+            vars.oraclePriceMantissa = IPriceOracle(oracle).getUnderlyingPrice(IClErc20(address(asset)));
             if (vars.oraclePriceMantissa == 0) {
-                revert ZeroPrice();
+                revert Errors.ZeroPrice();
             }
 
-            vars.oraclePrice = Exp({ mantissa: vars.oraclePriceMantissa });
+            vars.oraclePrice = Exp({mantissa: vars.oraclePriceMantissa});
 
             // Pre-compute a conversion factor from tokens -> ether (normalized price value)
-            vars.tokensToDenom = mul_(
-                mul_(vars.collateralFactor, vars.exchangeRate),
-                vars.oraclePrice
-            );
+            vars.tokensToDenom = mul_(mul_(vars.collateralFactor, vars.exchangeRate), vars.oraclePrice);
 
             // sumCollateral += tokensToDenom * clTokenBalance
-            vars.sumCollateral = mul_ScalarTruncateAddUInt(
-                vars.tokensToDenom,
-                vars.clTokenBalance,
-                vars.sumCollateral
-            );
+            vars.sumCollateral = mul_ScalarTruncateAddUInt(vars.tokensToDenom, vars.clTokenBalance, vars.sumCollateral);
 
             // sumBorrowPlusEffects += oraclePrice * borrowBalance
-            vars.sumBorrowPlusEffects = mul_ScalarTruncateAddUInt(
-                vars.oraclePrice,
-                vars.borrowBalance,
-                vars.sumBorrowPlusEffects
-            );
+            vars.sumBorrowPlusEffects =
+                mul_ScalarTruncateAddUInt(vars.oraclePrice, vars.borrowBalance, vars.sumBorrowPlusEffects);
 
             // Calculate effects of interacting with clTokenModify
             if (address(asset) == clTokenModify) {
                 // redeem effect
                 // sumBorrowPlusEffects += tokensToDenom * redeemTokens
-                vars.sumBorrowPlusEffects = mul_ScalarTruncateAddUInt(
-                    vars.tokensToDenom,
-                    redeemTokens,
-                    vars.sumBorrowPlusEffects
-                );
+                vars.sumBorrowPlusEffects =
+                    mul_ScalarTruncateAddUInt(vars.tokensToDenom, redeemTokens, vars.sumBorrowPlusEffects);
 
                 // borrow effect
                 // sumBorrowPlusEffects += oraclePrice * borrowAmount
-                vars.sumBorrowPlusEffects = mul_ScalarTruncateAddUInt(
-                    vars.oraclePrice,
-                    borrowAmount,
-                    vars.sumBorrowPlusEffects
-                );
+                vars.sumBorrowPlusEffects =
+                    mul_ScalarTruncateAddUInt(vars.oraclePrice, borrowAmount, vars.sumBorrowPlusEffects);
             }
         }
 
@@ -998,15 +901,11 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     function liquidateCalculateSeizeTokens(
         address clTokenBorrowed,
         address clTokenCollateral,
-        uint actualRepayAmount
-    ) external view override returns (uint) {
+        uint256 actualRepayAmount
+    ) external view override returns (uint256) {
         /* Read oracle prices for borrowed and collateral markets */
-        uint priceBorrowedMantissa = IPriceOracle(oracle).getUnderlyingPrice(
-            IClErc20(clTokenBorrowed)
-        );
-        uint priceCollateralMantissa = IPriceOracle(oracle).getUnderlyingPrice(
-            IClErc20(clTokenCollateral)
-        );
+        uint256 priceBorrowedMantissa = IPriceOracle(oracle).getUnderlyingPrice(IClErc20(clTokenBorrowed));
+        uint256 priceCollateralMantissa = IPriceOracle(oracle).getUnderlyingPrice(IClErc20(clTokenCollateral));
         if (priceBorrowedMantissa == 0 || priceCollateralMantissa == 0) {
             return 0;
         }
@@ -1017,20 +916,14 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
          *  seizeTokens = seizeAmount / exchangeRate
          *   = actualRepayAmount * (liquidationIncentive * priceBorrowed) / (priceCollateral * exchangeRate)
          */
-        uint exchangeRateMantissa = IClToken(clTokenCollateral).exchangeRateStored(); // Note: reverts on error
-        uint seizeTokens;
+        uint256 exchangeRateMantissa = IClToken(clTokenCollateral).exchangeRateStored(); // Note: reverts on error
+        uint256 seizeTokens;
         Exp memory numerator;
         Exp memory denominator;
         Exp memory ratio;
 
-        numerator = mul_(
-            Exp({ mantissa: liquidationIncentiveMantissa }),
-            Exp({ mantissa: priceBorrowedMantissa })
-        );
-        denominator = mul_(
-            Exp({ mantissa: priceCollateralMantissa }),
-            Exp({ mantissa: exchangeRateMantissa })
-        );
+        numerator = mul_(Exp({mantissa: liquidationIncentiveMantissa}), Exp({mantissa: priceBorrowedMantissa}));
+        denominator = mul_(Exp({mantissa: priceCollateralMantissa}), Exp({mantissa: exchangeRateMantissa}));
         ratio = div_(numerator, denominator);
 
         seizeTokens = mul_ScalarTruncate(ratio, actualRepayAmount);
@@ -1038,19 +931,21 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         return seizeTokens;
     }
 
-    /*** CLR Distribution ***/
+    /**
+     * CLR Distribution **
+     */
 
     /**
      * @notice Calculate additional accrued CLR for a contributor since last accrual
      * @param contributor The address to calculate contributor rewards for
      */
     function updateContributorRewards(address contributor) public {
-        uint clrSpeed = clrContributorSpeeds[contributor];
-        uint blockNumber = getBlockNumber();
-        uint deltaBlocks = sub_(blockNumber, lastContributorBlock[contributor]);
+        uint256 clrSpeed = clrContributorSpeeds[contributor];
+        uint256 blockNumber = getBlockNumber();
+        uint256 deltaBlocks = sub_(blockNumber, lastContributorBlock[contributor]);
         if (deltaBlocks > 0 && clrSpeed > 0) {
-            uint newAccrued = mul_(deltaBlocks, clrSpeed);
-            uint contributorAccrued = add_(clrAccrued[contributor], newAccrued);
+            uint256 newAccrued = mul_(deltaBlocks, clrSpeed);
+            uint256 contributorAccrued = add_(clrAccrued[contributor], newAccrued);
 
             clrAccrued[contributor] = contributorAccrued;
             lastContributorBlock[contributor] = blockNumber;
@@ -1058,13 +953,18 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     }
 
     /**
-     * @notice Claim all the clr accrued by holder in all markets
-     * @param holder The address to claim CLR for
-     */
+    * @notice Claim all the clr accrued by holder in all markets
+    * @param holder The address to claim CLR for
+    */
     function claimClr(address holder) public {
-        claimClr(holder, allMarkets);
+        // Create array of markets from the mapping
+        address[] memory markets = new address[](marketCount);
+        for (uint i = 0; i < marketCount; i++) {
+            markets[i] = allMarketsIndex[i];
+        }
+        claimClr(holder, markets);
     }
-
+    
     /**
      * @notice Claim all the clr accrued by holder in the specified markets
      * @param holder The address to claim CLR for
@@ -1082,33 +982,28 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param clTokens The list of markets to claim CLR in
      * @param borrowers Whether or not to claim CLR earned by borrowing
      * @param suppliers Whether or not to claim CLR earned by supplying
-     */
-    function claimClr(
-        address[] memory holders,
-        address[] memory clTokens,
-        bool borrowers,
-        bool suppliers
-    ) public {
-        for (uint i = 0; i < clTokens.length; i++) {
+     */ ///TODO: Rething the logic because of DOS?
+    function claimClr(address[] memory holders, address[] memory clTokens, bool borrowers, bool suppliers) public {
+        for (uint256 i = 0; i < clTokens.length; i++) {
             address clToken = clTokens[i];
             if (!markets[clToken].isListed) {
-                revert MarketIsNotListed(clToken);
+                revert Errors.MarketIsNotListed(clToken);
             }
             if (borrowers == true) {
-                Exp memory borrowIndex = Exp({ mantissa: IClToken(clToken).borrowIndex() });
+                Exp memory borrowIndex = Exp({mantissa: IClToken(clToken).borrowIndex()});
                 updateClrBorrowIndex(clToken, borrowIndex);
-                for (uint j = 0; j < holders.length; j++) {
+                for (uint256 j = 0; j < holders.length; j++) {
                     distributeBorrowerClr(clToken, holders[j], borrowIndex);
                 }
             }
             if (suppliers == true) {
                 updateClrSupplyIndex(clToken);
-                for (uint j = 0; j < holders.length; j++) {
+                for (uint256 j = 0; j < holders.length; j++) {
                     distributeSupplierClr(clToken, holders[j]);
                 }
             }
         }
-        for (uint j = 0; j < holders.length; j++) {
+        for (uint256 j = 0; j < holders.length; j++) {
             clrAccrued[holders[j]] = grantClrInternal(holders[j], clrAccrued[holders[j]]);
         }
     }
@@ -1119,10 +1014,10 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param supplySpeed New supply-side CLR speed for market
      * @param borrowSpeed New borrow-side CLR speed for market
      */
-    function setClrSpeedInternal(address clToken, uint supplySpeed, uint borrowSpeed) internal {
+    function setClrSpeedInternal(address clToken, uint256 supplySpeed, uint256 borrowSpeed) internal {
         Market storage market = markets[clToken];
         if (!market.isListed) {
-            revert MarketIsNotListed(clToken);
+            revert Errors.MarketIsNotListed(clToken);
         }
 
         if (clrSupplySpeeds[clToken] != supplySpeed) {
@@ -1140,7 +1035,7 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
             // Borrow speed updated so let's update borrow state to ensure that
             //  1. CLR accrued properly for the old speed, and
             //  2. CLR accrued at the new speed starts after this block.
-            Exp memory borrowIndex = Exp({ mantissa: IClToken(clToken).borrowIndex() });
+            Exp memory borrowIndex = Exp({mantissa: IClToken(clToken).borrowIndex()});
             updateClrBorrowIndex(clToken, borrowIndex);
 
             // Update speed and emit event
@@ -1156,19 +1051,15 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      */
     function updateClrSupplyIndex(address clToken) internal {
         ClrMarketState storage supplyState = clrSupplyState[clToken];
-        uint supplySpeed = clrSupplySpeeds[clToken];
+        uint256 supplySpeed = clrSupplySpeeds[clToken];
         uint32 blockNumber = safe32(getBlockNumber(), "block number exceeds 32 bits");
-        uint deltaBlocks = sub_(uint(blockNumber), uint(supplyState.block));
+        uint256 deltaBlocks = sub_(uint256(blockNumber), uint256(supplyState.block));
         if (deltaBlocks > 0 && supplySpeed > 0) {
-            uint _supplyTokens = IClToken(clToken).totalSupply();
-            uint _clrAccrued = mul_(deltaBlocks, supplySpeed);
-            Double memory ratio = _supplyTokens > 0
-                ? fraction(_clrAccrued, _supplyTokens)
-                : Double({ mantissa: 0 });
-            supplyState.index = safe224(
-                add_(Double({ mantissa: supplyState.index }), ratio).mantissa,
-                "new index exceeds 224 bits"
-            );
+            uint256 _supplyTokens = IClToken(clToken).totalSupply();
+            uint256 _clrAccrued = mul_(deltaBlocks, supplySpeed);
+            Double memory ratio = _supplyTokens > 0 ? fraction(_clrAccrued, _supplyTokens) : Double({mantissa: 0});
+            supplyState.index =
+                safe224(add_(Double({mantissa: supplyState.index}), ratio).mantissa, "new index exceeds 224 bits");
             supplyState.block = blockNumber;
         } else if (deltaBlocks > 0) {
             supplyState.block = blockNumber;
@@ -1182,24 +1073,22 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      */
     function updateClrBorrowIndex(address clToken, Exp memory marketBorrowIndex) internal {
         ClrMarketState storage borrowState = clrBorrowState[clToken];
-        uint borrowSpeed = clrBorrowSpeeds[clToken];
+        uint256 borrowSpeed = clrBorrowSpeeds[clToken];
         uint32 blockNumber = safe32(getBlockNumber(), "block number exceeds 32 bits");
-        uint deltaBlocks = sub_(uint(blockNumber), uint(borrowState.block));
+        uint256 deltaBlocks = sub_(uint256(blockNumber), uint256(borrowState.block));
         if (deltaBlocks > 0 && borrowSpeed > 0) {
-            uint _borrowAmount = div_(IClToken(clToken).totalBorrows(), marketBorrowIndex);
-            uint _clrAccrued = mul_(deltaBlocks, borrowSpeed);
-            Double memory ratio = _borrowAmount > 0
-                ? fraction(_clrAccrued, _borrowAmount)
-                : Double({ mantissa: 0 });
-            borrowState.index = safe224(
-                add_(Double({ mantissa: borrowState.index }), ratio).mantissa,
-                "new index exceeds 224 bits"
-            );
+            uint256 _borrowAmount = div_(IClToken(clToken).totalBorrows(), marketBorrowIndex);
+            uint256 _clrAccrued = mul_(deltaBlocks, borrowSpeed);
+            Double memory ratio = _borrowAmount > 0 ? fraction(_clrAccrued, _borrowAmount) : Double({mantissa: 0});
+            borrowState.index =
+                safe224(add_(Double({mantissa: borrowState.index}), ratio).mantissa, "new index exceeds 224 bits");
             borrowState.block = blockNumber;
         } else if (deltaBlocks > 0) {
             borrowState.block = blockNumber;
         }
     }
+
+
 
     /**
      * @notice Calculate CLR accrued by a supplier and possibly transfer it to them
@@ -1212,8 +1101,8 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         // - We really don't want to call an external contract as that's quite expensive.
 
         ClrMarketState storage supplyState = clrSupplyState[clToken];
-        uint supplyIndex = supplyState.index;
-        uint supplierIndex = clrSupplierIndex[clToken][supplier];
+        uint256 supplyIndex = supplyState.index;
+        uint256 supplierIndex = clrSupplierIndex[clToken][supplier];
 
         // Update supplier's index to the current index since we are distributing accrued CLR
         clrSupplierIndex[clToken][supplier] = supplyIndex;
@@ -1226,14 +1115,14 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         }
 
         // Calculate change in the cumulative sum of the CLR per clToken accrued
-        Double memory deltaIndex = Double({ mantissa: sub_(supplyIndex, supplierIndex) });
+        Double memory deltaIndex = Double({mantissa: sub_(supplyIndex, supplierIndex)});
 
-        uint supplierTokens = IClToken(clToken).balanceOf(supplier);
+        uint256 supplierTokens = IClToken(clToken).balanceOf(supplier);
 
         // Calculate CLR accrued: clTokenAmount * accruedPerClToken
-        uint supplierDelta = mul_(supplierTokens, deltaIndex);
+        uint256 supplierDelta = mul_(supplierTokens, deltaIndex);
 
-        uint supplierAccrued = add_(clrAccrued[supplier], supplierDelta);
+        uint256 supplierAccrued = add_(clrAccrued[supplier], supplierDelta);
         clrAccrued[supplier] = supplierAccrued;
 
         emit DistributedSupplierClr(clToken, supplier, supplierDelta, supplyIndex);
@@ -1245,18 +1134,14 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param clToken The market in which the borrower is interacting
      * @param borrower The address of the borrower to distribute CLR to
      */
-    function distributeBorrowerClr(
-        address clToken,
-        address borrower,
-        Exp memory marketBorrowIndex
-    ) internal {
+    function distributeBorrowerClr(address clToken, address borrower, Exp memory marketBorrowIndex) internal {
         // TODO: Don't distribute supplier CLR if the user is not in the borrower market.
         // This check should be as gas efficient as possible as distributeBorrowerClr is called in many places.
         // - We really don't want to call an external contract as that's quite expensive.
 
         ClrMarketState storage borrowState = clrBorrowState[clToken];
-        uint borrowIndex = borrowState.index;
-        uint borrowerIndex = clrBorrowerIndex[clToken][borrower];
+        uint256 borrowIndex = borrowState.index;
+        uint256 borrowerIndex = clrBorrowerIndex[clToken][borrower];
 
         // Update borrowers's index to the current index since we are distributing accrued CLR
         clrBorrowerIndex[clToken][borrower] = borrowIndex;
@@ -1269,17 +1154,14 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         }
 
         // Calculate change in the cumulative sum of the CLR per borrowed unit accrued
-        Double memory deltaIndex = Double({ mantissa: sub_(borrowIndex, borrowerIndex) });
+        Double memory deltaIndex = Double({mantissa: sub_(borrowIndex, borrowerIndex)});
 
-        uint borrowerAmount = div_(
-            IClToken(clToken).borrowBalanceStored(borrower),
-            marketBorrowIndex
-        );
+        uint256 borrowerAmount = div_(IClToken(clToken).borrowBalanceStored(borrower), marketBorrowIndex);
 
         // Calculate CLR accrued: clTokenAmount * accruedPerBorrowedUnit
-        uint borrowerDelta = mul_(borrowerAmount, deltaIndex);
+        uint256 borrowerDelta = mul_(borrowerAmount, deltaIndex);
 
-        uint borrowerAccrued = add_(clrAccrued[borrower], borrowerDelta);
+        uint256 borrowerAccrued = add_(clrAccrued[borrower], borrowerDelta);
         clrAccrued[borrower] = borrowerAccrued;
 
         emit DistributedBorrowerClr(clToken, borrower, borrowerDelta, borrowIndex);
@@ -1292,8 +1174,8 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
      * @param amount The amount of CLR to (possibly) transfer
      * @return The amount of CLR which was NOT transferred to the user
      */
-    function grantClrInternal(address user, uint amount) internal returns (uint) {
-        uint clrRemaining = IClusterToken(clrAddress).balanceOf(address(this));
+    function grantClrInternal(address user, uint256 amount) internal returns (uint256) {
+        uint256 clrRemaining = IClusterToken(clrAddress).balanceOf(address(this));
         if (amount > 0 && amount <= clrRemaining) {
             IClusterToken(clrAddress).transfer(user, amount);
             return 0;
@@ -1302,37 +1184,30 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
     }
 
     /**
-     * @notice Return all of the markets
-     * @dev The automatic getter may be used to access an individual market.
-     * @return The list of market addresses
-     */
-    function getAllMarkets() public view returns (address[] memory) {
-        return allMarkets;
-    }
-
-    /**
      * @notice Returns true if the given clToken market has been deprecated
      * @dev All borrows in a deprecated clToken market can be immediately liquidated
      * @param clToken The market to check if deprecated
      */
     function isDeprecated(address clToken) public view returns (bool) {
-        return
-            markets[clToken].collateralFactorMantissa == 0 &&
-            borrowGuardianPaused[clToken] == true &&
-            IClToken(clToken).reserveFactorMantissa() == 1e18;
+        return markets[clToken].collateralFactorMantissa == 0 && borrowGuardianPaused[clToken] == true
+            && IClToken(clToken).reserveFactorMantissa() == 1e18;
     }
 
-    function getBlockNumber() public view virtual returns (uint) {
+    function getBlockNumber() public view virtual returns (uint256) {
         return block.number;
     }
 
+
+    // TODO: need clarification bcs unnecessary loop.
     function _addMarketInternal(address clToken) internal {
-        for (uint i = 0; i < allMarkets.length; i++) {
-            if (allMarkets[i] == clToken) {
-                revert MarketAlreadyAdded();
-            }
+        if (isMarketListed[clToken]) {
+            revert Errors.MarketAlreadyAdded();
         }
-        allMarkets.push(clToken);
+        
+        // Add to mappings
+        isMarketListed[clToken] = true;
+        allMarketsIndex[marketCount] = clToken;
+        marketCount++;
     }
 
     function _initializeMarket(address clToken) internal {
@@ -1360,8 +1235,6 @@ contract Comptroller is Initializable, IComptroller, ExponentialNoError, Comptro
         supplyState.block = borrowState.block = blockNumber;
     }
 
-    /// @dev Checks if caller is admin
-    function _onlyAdmin() internal view {
-        if (msg.sender != admin) revert NotAdmin();
-    }
+    /// @dev Ensures that only the admin can upgrade the contract
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 }
